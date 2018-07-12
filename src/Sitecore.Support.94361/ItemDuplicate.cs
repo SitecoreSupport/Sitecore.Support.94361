@@ -1,130 +1,96 @@
-﻿
-using Sitecore;
-using Sitecore.Buckets.Extensions;
-using Sitecore.Buckets.Managers;
-using Sitecore.Configuration;
+﻿using Sitecore.Configuration;
 using Sitecore.Data;
 using Sitecore.Data.Events;
 using Sitecore.Data.Items;
-using Sitecore.Data.Managers;
 using Sitecore.Diagnostics;
 using Sitecore.Events;
-using Sitecore.Globalization;
-using Sitecore.Shell.Framework.Pipelines;
+using Sitecore.SecurityModel;
+using Sitecore.StringExtensions;
 using Sitecore.Web.UI.Sheer;
+using Sitecore.Workflows;
 using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
 namespace Sitecore.Support.Buckets.Pipelines.UI
 {
-
-
-  public class ItemDuplicate : DuplicateItem
+  class ItemDuplicate : Sitecore.Buckets.Pipelines.UI.ItemDuplicate
   {
-    public new void Execute(ClientPipelineArgs args)
+
+    Database database;
+    protected override Item DuplicateItem(Item item, string name)
     {
-      Assert.ArgumentNotNull(args, "args");
-      Database database = ExtractDatabase(args);
-      string path = args.Parameters["id"];
-      Item item = database.GetItem(path);
-      if (item == null)
+      //Code in this method changed for patch, Previously just returned the Context.Workflow.DuplicateItem(item, name);
+      if (!item.Fields["__Default workflow"].Value.IsNullOrEmpty() && (item.Fields["__Workflow"].Value.IsNullOrEmpty() || item.Fields["__Workflow state"].Value.IsNullOrEmpty()))
       {
-        ShowLocalizedAlert("Item not found.", Array.Empty<object>());
-        args.AbortPipeline();
+        Item i = item.Duplicate(name);
+        SetWorkflowsForItem(i);
+        Context.Workflow.ResetWorkflowState(i, true);
+        i.Locking.Unlock();
+        if (i.Versions.Count > 0)
+        {
+          Context.Workflow.StartEditing(i);
+        }
+        return i;
       }
       else
       {
-        Item parent = item.Parent;
-        if (parent == null)
-        {
-          ShowLocalizedAlert("Cannot duplicate the root item.", Array.Empty<object>());
-          args.AbortPipeline();
-        }
-        else if (parent.Access.CanCreate())
-        {
-          Log.Audit(this, "Duplicate item: {0}", AuditFormatter.FormatItem(item));
-          Item parentBucketItemOrSiteRoot = GetParentBucketItemOrSiteRoot(item);
-          if (IsBucket(parentBucketItemOrSiteRoot) && IsBucketable(item))
-          {
-            if (!EventDisabler.IsActive)
-            {
-              EventResult eventResult = Event.RaiseEvent("item:bucketing:duplicating", args, this);
-              if (eventResult != null && eventResult.Cancel)
-              {
-                Log.Info(string.Format("Event {0} was cancelled", "item:bucketing:duplicating"), this);
-                args.AbortPipeline();
-                return;
-              }
-            }
-            Item item2 = DuplicateItem(item, args.Parameters["name"]);
-           // Item destination = CreateAndReturnBucketFolderDestination(parentBucketItemOrSiteRoot, DateUtil.ToUniversalTime(DateTime.Now), item);
-            // if (!item.IsBucketTemplateCheck()) // Commenting out as this code does not have to compile for it is just for future use of this patch so people see what has changed uncomment the code for the real old implementation.
-            // {
-            //    destination = parentBucketItemOrSiteRoot;
-            //   }
-            //MoveItem(item2, destination);
-            if (!EventDisabler.IsActive)
-            {
-              Event.RaiseEvent("item:bucketing:duplicated", args, this);
-            }
-          }
-          else
-          {
-            DuplicateItem(item, args.Parameters["name"]);
-          }
-        }
-        else
-        {
-          ShowLocalizedAlert("You do not have permission to duplicate \"{0}\".", item.DisplayName);
-          args.AbortPipeline();
-        }
-      }
-      args.AbortPipeline();
-    }
-
-    protected virtual void MoveItem(Item item, Item destination)
-    {
-      using (new StatisticDisabler())
-      {
-        ItemManager.MoveItem(item, destination);
+        return Context.Workflow.DuplicateItem(item, name);
       }
     }
 
-    //  protected virtual Item CreateAndReturnBucketFolderDestination(Item bucketItem, DateTime createdDate, Item item) !!!!!!!!!!!!Uncomment this for real impl just commenting to compile quickly and commit original before changing to patch.
-    //{
-    //return BucketManager.CreateAndReturnBucketFolderDestination(bucketItem, createdDate, item);
-    //}
-
-    protected virtual Item GetParentBucketItemOrSiteRoot(Item item)
-    {
-      return item.GetParentBucketItemOrSiteRoot();
-    }
-
-    protected virtual Item DuplicateItem(Item item, string name)
-    {
-      return Context.Workflow.DuplicateItem(item, name);
-    }
-
-    protected virtual bool IsBucket(Item item)
-    {
-      return BucketManager.IsBucket(item);
-    }
-
-    protected virtual bool IsBucketable(Item item)
-    {
-      return BucketManager.IsBucketable(item);
-    }
-
-    protected virtual Database ExtractDatabase(ClientPipelineArgs args)
+    protected override Database ExtractDatabase(ClientPipelineArgs args)
     {
       Assert.ArgumentNotNull(args, "args");
-      Database database = Factory.GetDatabase(args.Parameters["database"]);
+      //Changed this to set the class variable and return instead of just return.
+      database = Factory.GetDatabase(args.Parameters["database"]);
       Assert.IsNotNull(database, args.Parameters["database"]);
       return database;
     }
 
-    protected virtual void ShowLocalizedAlert(string message, params object[] parameters)
+    //Methods from old patch to change workflow of item to initial state after duplication.
+    private void SetWorkflowsForItem(Item source)
     {
-      SheerResponse.Alert(Translate.Text(message, parameters), Array.Empty<string>());
+      IWorkflow defaultWorkflow = GetDefaultWorkflow(source);
+      IEnumerable versions = source.Versions.GetVersions(true);
+      foreach (Item item in versions)
+      {
+        if (defaultWorkflow != null)
+        {
+          using (new SecurityDisabler())
+          {
+            using (new EditContext(item))
+            {
+              item.Fields["__Workflow"].Value = defaultWorkflow.WorkflowID;
+              item.Fields["__Workflow state"].Value = database.GetItem(defaultWorkflow.WorkflowID).Fields["Initial state"].Value;
+            }
+          }
+        }
+      }
     }
-  }
 
+    private IWorkflow GetDefaultWorkflow(Item item)
+    {
+      if (item != null)
+      {
+        return GetWorkflow(item.Fields["__Default workflow"].Value);
+      }
+      return null;
+    }
+
+    private IWorkflow GetWorkflow(string wfId)
+    {
+      if (!wfId.IsNullOrEmpty() && database.GetItem(wfId) != null)
+      {
+        return database.WorkflowProvider.GetWorkflow(wfId);
+      }
+      return null;
+    }
+
+
+
+  }
 }
