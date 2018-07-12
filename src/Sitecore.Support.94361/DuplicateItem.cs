@@ -39,7 +39,8 @@ namespace Sitecore.Support.Shell.Framework.Pipelines
       database = Factory.GetDatabase(args.Parameters["database"]);
       Assert.IsNotNull(database, args.Parameters["database"]);
       string value = args.Parameters["id"];
-      if (!Language.TryParse(args.Parameters["language"], out Language result))
+      Language result;
+      if (!Language.TryParse(args.Parameters["language"],out result))
       {
         result = Context.Language;
       }
